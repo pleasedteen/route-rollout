@@ -16,6 +16,7 @@ import os
 import random
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -119,6 +120,12 @@ class Handler(BaseHTTPRequestHandler):
             with urllib.request.urlopen(req, timeout=10) as resp:
                 body = resp.read()
                 status = resp.status
+        except urllib.error.HTTPError as exc:
+            # 上游的业务错误(如 409 粘性请求被停用拦截)必须原样透传,
+            # 不能包装成 502, 否则调用方读不到真实状态码与错误原因。
+            body = exc.read()
+            self._send(exc.code, body)
+            return
         except Exception as exc:
             body = json.dumps({"error": f"proxy upstream error: {exc}"}).encode()
             self._send(502, body)

@@ -19,12 +19,18 @@ from datetime import datetime
 from typing import Dict, List, Mapping, Optional, Tuple
 
 from .model import (
+    Migration,
     Ruleset,
     Topology,
     ruleset_to_plain,
     version_token,
 )
-from .planner import Plan, load_ruleset_file, make_plan
+from .planner import (
+    Plan,
+    load_ruleset_file,
+    make_migration_plan,
+    make_plan,
+)
 from .state import ReleaseStore
 
 POLL_INTERVAL = 0.3
@@ -75,6 +81,8 @@ class Publisher:
         self.forward_plan = Plan.from_dict(data["forward_plan"])
         self.rollback_plan = (Plan.from_dict(data["rollback_plan"])
                               if data.get("rollback_plan") else None)
+        self.migration = (Migration.from_dict(data["migration"])
+                          if data.get("migration") else None)
         self.stop_requested = False
 
     @staticmethod
@@ -88,16 +96,35 @@ class Publisher:
         _, body = http_json(self.registry[node] + "/status")
         return body
 
-    def apply_node(self, node: str, rules: Ruleset) -> dict:
-        code, body = http_json(self.registry[node] + "/apply",
-                               {"rules": ruleset_to_plain(rules)})
+    def apply_node(self, node: str, rules: Ruleset,
+                   label: Optional[str] = None,
+                   previous_label: Optional[str] = None) -> dict:
+        payload = {"rules": ruleset_to_plain(rules)}
+        if label is not None:
+            payload["label"] = label
+            payload["previous_label"] = previous_label or "old"
+        code, body = http_json(self.registry[node] + "/apply", payload)
         if code != 200 or "version" not in body:
             raise RuntimeError(f"{node} apply 返回 {code}: {body}")
         return body
 
-    def probe_node(self, node: str, cls: str) -> dict:
-        return http_json(self.registry[node] + "/probe",
-                         {"class": cls, "path": [], "visited": []})[1]
+    def probe_node(self, node: str, cls: str, pin: Optional[str] = None) -> dict:
+        payload = {"class": cls, "path": [], "visited": []}
+        if pin is not None:
+            payload["pin"] = pin
+        return http_json(self.registry[node] + "/probe", payload)[1]
+
+    def decommission_node(self, node: str, cls: str, label: str) -> dict:
+        code, body = http_json(self.registry[node] + "/decommission",
+                               {"class": cls, "label": label})
+        if code != 200 or not body.get("ok"):
+            raise RuntimeError(f"{node} decommission 返回 {code}: {body}")
+        return body
+
+    def recommission_node(self, node: str, cls: str, label: str) -> dict:
+        _, body = http_json(self.registry[node] + "/recommission",
+                            {"class": cls, "label": label})
+        return body
 
     # ---- 实际版本对账 -----------------------------------------------------
 
@@ -136,13 +163,29 @@ class Publisher:
         new_tok = self.token_map(self.new_rules)
 
         if phase == "FORWARD_COMPLETE":
+            if self.migration is not None:
+                return self._tick_drain(actual, old_tok, new_tok)
             return phase
+        if phase == "DECOMMISSIONED":
+            return phase
+        if phase == "DRAINING":
+            return self._tick_drain(actual, old_tok, new_tok)
         if phase == "ROLLED_BACK":
             return phase
         # PAUSED/FAILED/RUNNING 按当前方向分派; 回退中途暂停也走回退循环
         if self.data["direction"] == "rollback":
             return self._tick_rollback(actual, old_tok, new_tok, phase)
         return self._tick_forward(actual, old_tok, new_tok, phase)
+
+    def _forward_done_phase(self) -> str:
+        """正向全部生效后的阶段: 普通发布完成, 迁移发布进入排水。"""
+        if self.migration is not None:
+            self.data = self.store.update(phase="DRAINING", last_error=None)
+            print(f"  [{now_str()}] 全部批次已生效, 进入排水阶段: "
+                  f"等待在途老请求结束后停用旧出口", flush=True)
+            return "DRAINING"
+        self.data = self.store.update(phase="FORWARD_COMPLETE", last_error=None)
+        return "FORWARD_COMPLETE"
 
     def _target_token(self, node: str, old_tok, new_tok) -> str:
         direction = self.data["direction"]
@@ -159,15 +202,11 @@ class Publisher:
 
         if not plan:
             if all(applied.get(n) == new_tok[n] for n in self.topo.nodes):
-                self.data = self.store.update(phase="FORWARD_COMPLETE",
-                                              last_error=None)
-                return "FORWARD_COMPLETE"
+                return self._forward_done_phase()
 
         if idx >= len(plan):
             if all(applied.get(n) == new_tok[n] for n in self.topo.nodes):
-                self.data = self.store.update(phase="FORWARD_COMPLETE",
-                                              last_error=None)
-                return "FORWARD_COMPLETE"
+                return self._forward_done_phase()
             # 所有批次都发过但版本不齐: 继续对账补齐(典型的确认丢失场景)
             self._drive_batch(set(self.topo.nodes), old_tok, new_tok)
             return phase
@@ -193,9 +232,7 @@ class Publisher:
             self.data = self.store.update(current_batch_index=idx + 1)
             if idx + 1 == len(plan):
                 if all(applied.get(n) == new_tok[n] for n in self.topo.nodes):
-                    self.data = self.store.update(phase="FORWARD_COMPLETE",
-                                                  last_error=None)
-                    return "FORWARD_COMPLETE"
+                    return self._forward_done_phase()
             return self.store.read()["phase"]
         # 当前批未齐: 暂停态不再开启新批次(本来也没开), 等下个 tick
         return phase
@@ -235,22 +272,93 @@ class Publisher:
                     return "ROLLED_BACK"
         return "ROLLING_BACK"
 
+    # ---- 固定出口迁移: 排水与旧出口停用 -----------------------------------
+
+    def _all_ingress_on_new(self, actual, new_tok) -> bool:
+        mig = self.migration
+        ingress = [n for n in self.topo.nodes
+                   if n not in (mig.old_egress, mig.new_egress)]
+        return all(actual.get(n) == new_tok[n] for n in ingress)
+
+    def _tick_drain(self, actual, old_tok, new_tok) -> str:
+        """正向切完后的排水: 入口全切新 + 在途老请求归零, 才停用旧出口。"""
+        mig = self.migration
+        old_egress = mig.old_egress
+        # 全部节点(含两个出口)都已到目标版本, 才允许进入停用判断
+        if not all(actual.get(n) == new_tok[n] for n in self.topo.nodes):
+            return self.store.read()["phase"]
+        if not self._all_ingress_on_new(actual, new_tok):
+            return self.store.read()["phase"]
+        # 汇总各服务实际状态: 旧标签在途计数(入口 inflight + 各跳 visiting)
+        statuses = {}
+        for node in self.topo.nodes:
+            statuses[node] = self.service_status(node)
+        old_inflight = sum(
+            int(st.get("inflight", {}).get("old", 0))
+            + int(st.get("visiting", {}).get("old", 0))
+            for st in statuses.values()
+        )
+        already = any(d.get("class") == mig.cls and d.get("label") == "old"
+                      for d in statuses[old_egress].get("decommissioned", []))
+        if already:
+            self.data = self.store.update(
+                phase="DECOMMISSIONED", last_error=None,
+                decommission={"node": old_egress, "class": mig.cls,
+                              "label": "old"})
+            return "DECOMMISSIONED"
+        if old_inflight > 0:
+            # 入口与在途请求仍可能依赖旧出口: 保持现网, 下个周期再查实际状态
+            print(f"  [{now_str()}] 排水中: 旧标签在途计数 {old_inflight}, "
+                  f"暂不停用旧出口 {old_egress}", flush=True)
+            return "DRAINING"
+        # 闸条件全部满足: 停用旧出口对该类流量旧版本的接收
+        try:
+            result = self.decommission_node(old_egress, mig.cls, "old")
+        except RuntimeError as exc:
+            self.data = self.store.update(
+                last_error=f"{now_str()} 停用旧出口被拒: {exc}")
+            return "DRAINING"
+        self.data = self.store.update(
+            phase="DECOMMISSIONED", last_error=None,
+            decommission={"node": old_egress, "class": mig.cls, "label": "old",
+                          "result": result})
+        print(f"  [{now_str()}] 入口已全切新、在途老请求归零: 旧出口 "
+              f"{old_egress} 已停用类别 {mig.cls} 的 old 接收", flush=True)
+        return "DECOMMISSIONED"
+
     def _drive_batch(self, nodes: set, old_tok, new_tok) -> None:
         """把一批服务推进到各自目标版本; 已在目标版本的跳过。
 
         同批顺序无所谓(规划已枚举验证任意子集安全)。暂停时调用方只会传入
         已开启的批次, 因此本函数不会在暂停时开启新批次。
+        迁移正向发布携带版本标签 old/new, 服务据此保留两套规则支持粘性选路。
         """
         direction = self.data["direction"]
         rules = self.new_rules if direction == "forward" else self.old_rules
         target_tok = new_tok if direction == "forward" else old_tok
+        use_labels = self.migration is not None
         for node in sorted(nodes):
             current = self.data["applied"].get(node)
             if current == target_tok[node]:
+                # 迁移模式下即使指纹已在目标版本, 也要确保服务登记了版本标签
+                # (新旧规则内容相同的节点不会发生 apply 变更, 但粘性选路仍需标签)
+                if use_labels:
+                    want_label = "new" if direction == "forward" else "old"
+                    live_st = self.service_status(node)
+                    if want_label not in live_st.get("labels", []):
+                        self.apply_node(node, rules[node], label=want_label,
+                                        previous_label=("old" if direction == "forward"
+                                                        else "new"))
                 continue
             # 再查一次实时状态, 处理"确认丢失但实际已生效"
             live = self.service_status(node)
             if live["version"] == target_tok[node]:
+                if use_labels:
+                    want_label = "new" if direction == "forward" else "old"
+                    if want_label not in live.get("labels", []):
+                        self.apply_node(node, rules[node], label=want_label,
+                                        previous_label=("old" if direction == "forward"
+                                                        else "new"))
                 self.data = self.store.update(
                     applied={**self.store.read()["applied"],
                              node: target_tok[node]})
@@ -262,7 +370,14 @@ class Publisher:
             resp = None
             for attempt in range(APPLY_MAX_ATTEMPTS):
                 try:
-                    resp = self.apply_node(node, rules[node])
+                    if use_labels and direction == "forward":
+                        resp = self.apply_node(node, rules[node],
+                                               label="new", previous_label="old")
+                    elif use_labels and direction == "rollback":
+                        resp = self.apply_node(node, rules[node],
+                                               label="old", previous_label="new")
+                    else:
+                        resp = self.apply_node(node, rules[node])
                     break
                 except RuntimeError as exc:
                     print(f"  [{now_str()}] {node}: apply 第 {attempt + 1} 次"
@@ -295,7 +410,11 @@ class Publisher:
 
     def run(self, wait: bool = True, max_seconds: float = 300.0) -> str:
         # PAUSED 由外部 pause 命令写入: 本进程观察到后收尾退出, 进度保留在状态文件
-        stop_phases = {"FORWARD_COMPLETE", "ROLLED_BACK", "PAUSED"}
+        if self.migration is not None and self.data["direction"] == "forward":
+            # 迁移正向发布: 排水停用完成才收工(FORWARD_COMPLETE 只是过渡)
+            stop_phases = {"DECOMMISSIONED", "PAUSED", "ROLLED_BACK"}
+        else:
+            stop_phases = {"FORWARD_COMPLETE", "ROLLED_BACK", "PAUSED"}
         deadline = time.monotonic() + max_seconds
         consecutive_errors = 0
         while not self.stop_requested:
@@ -348,13 +467,36 @@ class Publisher:
                 raise SystemExit(
                     f"节点 {node} 的实际版本 {tok} 既非发布前也非目标版本, "
                     f"拒绝自动回退, 请人工核查")
-        plan = make_plan(self.topo, current_rules, self.old_rules,
-                         max_batch_size, max_batches, direction="rollback")
+        plan = self._plan_rollback(current_rules, max_batch_size, max_batches)
         if not plan.ok:
             raise SystemExit(f"回退无解, 原配置保持不变: {plan.reason}")
         self.data = self.store.update(rollback_plan=plan.to_dict())
         self.rollback_plan = plan
         return plan
+
+    def _plan_rollback(self, current_rules, max_batch_size, max_batches) -> Plan:
+        if self.migration is None:
+            return make_plan(self.topo, current_rules, self.old_rules,
+                             max_batch_size, max_batches, direction="rollback")
+        # 迁移回退: 旧出口第一批恢复接收, 入口节点不进第一批, 避免在旧出口
+        # 恢复前把流量按旧规则送到已经不再吸收的节点。
+        return make_migration_plan(
+            self.topo, current_rules, self.old_rules, self.migration,
+            max_batch_size, max_batches,
+            direction="rollback", ordering=True)
+
+    def recommission_old_egress(self) -> None:
+        """回退第一步: 恢复旧出口对迁移类别 old 版本的接收(幂等)。"""
+        if self.migration is None:
+            return
+        mig = self.migration
+        try:
+            res = self.recommission_node(mig.old_egress, mig.cls, "old")
+            print(f"  [{now_str()}] 回退准备: 旧出口 {mig.old_egress} 恢复 "
+                  f"类别 {mig.cls} 的 old 接收 (changed={res.get('changed')})",
+                  flush=True)
+        except RuntimeError as exc:
+            raise SystemExit(f"恢复旧出口接收失败, 已中止回退: {exc}")
 
 
 # --------------------------------------------------------------------- 命令
@@ -408,7 +550,8 @@ def cmd_resume(args) -> None:
 def cmd_pause(args) -> None:
     store = ReleaseStore(args.state)
     data = store.read()
-    if data["phase"] not in ("RUNNING", "FAILED", "ROLLING_BACK"):
+    if data["phase"] not in ("RUNNING", "FAILED", "ROLLING_BACK",
+                             "DRAINING"):
         print(f"当前阶段 {data['phase']} 无需暂停")
         return
     store.update(phase="PAUSED")
@@ -440,6 +583,8 @@ def cmd_rollback(args) -> None:
     print("回退计划(同样受单批规模与可达性约束):")
     for i, batch in enumerate(plan.batches, 1):
         print(f"  回退批 {i:>2}: {', '.join(batch)}")
+    # 迁移场景: 先恢复旧出口接收, 再按批把规则切回, 否则旧规则流量无处吸收
+    pub.recommission_old_egress()
     store.update(phase="ROLLING_BACK", direction="rollback",
                  current_batch_index=0)
     _install_signals(pub)
@@ -456,6 +601,9 @@ def cmd_status(args) -> None:
     print("=" * 68)
     print(f"发布 {data['release_id']}  阶段: {data['phase']}  "
           f"方向: {data['direction']}")
+    if pub.migration:
+        print(f"固定出口迁移: 类别 {pub.migration.cls} 的出口 "
+              f"{pub.migration.old_egress} -> {pub.migration.new_egress}")
     print("=" * 68)
     plan = (pub.rollback_plan if data["direction"] == "rollback"
             and pub.rollback_plan else pub.forward_plan)
@@ -464,6 +612,12 @@ def cmd_status(args) -> None:
     print("-" * 68)
     print(f"{'服务':<10}{'实际版本':<22}{'发布前':<10}{'目标':<10}状态")
     actual, unreachable = pub.reconcile()
+    statuses = {}
+    for node in pub.topo.nodes:
+        try:
+            statuses[node] = pub.service_status(node)
+        except RuntimeError:
+            statuses[node] = {}
     for node in pub.topo.nodes:
         tok = actual.get(node, "<不可达>")
         if tok == new_tok[node]:
@@ -477,6 +631,18 @@ def cmd_status(args) -> None:
               f"{short(new_tok[node]):<10}{mark}")
     if unreachable:
         print("不可达: " + "; ".join(unreachable))
+    if pub.migration:
+        print("-" * 68)
+        for node in pub.topo.nodes:
+            st = statuses.get(node, {})
+            labels = ",".join(st.get("labels", [])) or "-"
+            inflight = st.get("inflight", {})
+            visiting = st.get("visiting", {})
+            decom = st.get("decommissioned", [])
+            print(f"  {node:<8} 标签[{labels}] 在途{inflight} 到达{visiting}"
+                  + (f" 已停用{decom}" if decom else ""))
+        if data.get("decommission"):
+            print(f" 停用记录: {data['decommission']}")
     if data.get("last_error"):
         print(f"最近错误: {data['last_error']}")
     idx = data["current_batch_index"]
@@ -484,26 +650,96 @@ def cmd_status(args) -> None:
 
 
 def cmd_verify(args) -> None:
-    """从每个服务、每类流量发起真实逐跳探测, 检查是否到达固定出口。"""
+    """从每个服务、每类流量发起真实逐跳探测, 检查是否到达固定出口。
+
+    迁移场景按版本标签双路验证: pin=old 的请求必须逐跳走到旧出口,
+    pin=new 的请求必须逐跳走到新出口(已停用旧接收时 old 路预期被明确拒绝)。
+    """
     store = ReleaseStore(args.state)
     pub = Publisher(store)
     failures = 0
     print("=" * 68)
     print("实时可达性验证(服务间逐跳真实转发)")
     print("=" * 68)
+    data = store.read()
+    decom_phase = data.get("phase") == "DECOMMISSIONED"
     for cls in pub.topo.classes:
-        egress = pub.topo.egress_of[cls]
+        static_egress = pub.topo.egress_of[cls]
         for start in pub.topo.nodes:
+            if pub.migration and cls == pub.migration.cls:
+                # 迁移类别: 分别按 old/new 两个版本标签粘性探测
+                for pin, expect_egress in (
+                    ("old", pub.migration.old_egress),
+                    ("new", pub.migration.new_egress),
+                ):
+                    res = pub.probe_node(start, cls, pin=pin)
+                    if res.get("ok") and res.get("egress") == expect_egress:
+                        print(f"  {start} [{cls} pin={pin}] -> "
+                              f"{' -> '.join(res['path'])} => 固定出口 "
+                              f"{expect_egress}  OK")
+                    elif pin == "old" and decom_phase and not res.get("ok"):
+                        print(f"  {start} [{cls} pin={pin}] 已按预期被旧出口"
+                              f"下线拦截: {res.get('error')}  OK")
+                    else:
+                        failures += 1
+                        print(f"  {start} [{cls} pin={pin}] 失败: "
+                              f"{res.get('error')}")
+                continue
             res = pub.probe_node(start, cls)
-            if res.get("ok") and res.get("egress") == egress:
+            if res.get("ok") and res.get("egress") == static_egress:
                 print(f"  {start} [{cls}] -> {' -> '.join(res['path'])} "
-                      f"=> 固定出口 {egress}  OK")
+                      f"=> 固定出口 {static_egress}  OK")
             else:
                 failures += 1
                 print(f"  {start} [{cls}] 失败: {res.get('error')}")
     print("-" * 68)
     print("全部可达" if failures == 0 else f"{failures} 条探测失败")
     raise SystemExit(1 if failures else 0)
+
+
+def cmd_submit_migration(args) -> None:
+    """固定出口迁移: 切入口前先出完整计划并按目标规则校验新出口。"""
+    topo = Topology.from_dict(json.load(open(args.topology, encoding="utf-8")))
+    old = load_ruleset_file(args.old_rules)
+    new = load_ruleset_file(args.new_rules)
+    mig = Migration(cls=args.traffic_class,
+                    old_egress=args.old_egress,
+                    new_egress=args.new_egress)
+    print("=" * 68)
+    print("固定出口迁移计划(动配置前生成, 此时不触碰任何服务)")
+    print("=" * 68)
+    print(f"  流量类别 {mig.cls} 的固定出口: "
+          f"{mig.old_egress} -> {mig.new_egress}")
+    if mig.cls not in topo.classes:
+        print(f"无解: 拓扑中不存在流量类别 {mig.cls}")
+        raise SystemExit(2)
+    for name, eg in (("旧出口", mig.old_egress), ("新出口", mig.new_egress)):
+        if eg not in topo.nodes:
+            print(f"无解: {name} {eg} 不是拓扑中的现有服务")
+            raise SystemExit(2)
+    if mig.old_egress == mig.new_egress:
+        print("无解: 新旧出口必须是两台不同的现有服务")
+        raise SystemExit(2)
+    plan = make_migration_plan(topo, old, new, mig,
+                               args.max_batch_size, args.max_batches)
+    if not plan.ok:
+        print(f"目标规则校验/规划不过: {plan.reason}")
+        print("原配置保留, 未创建任何发布状态, 现网配置未被触碰。")
+        raise SystemExit(2)
+    for i, batch in enumerate(plan.batches, 1):
+        print(f"  批次 {i:>2}: {', '.join(batch)}")
+    print(f"  批数 {len(plan.batches)} <= 上限 {args.max_batches}; "
+          f"单批规模 {max(len(b) for b in plan.batches)} <= 上限 "
+          f"{args.max_batch_size}")
+    print("  目标闸: 新出口已是 local_egress、旧出口已改为转发、"
+          "无其他节点成为出口")
+    print("  安全性: 已枚举每批任意部分生效子集, 迁移类别在新旧出口均可达")
+    store = ReleaseStore(args.state)
+    store.create(release_id=args.release_id, topology_path=args.topology,
+                 old_rules_path=args.old_rules, new_rules_path=args.new_rules,
+                 plan=plan, registry_path=args.registry,
+                 migration=mig.to_dict())
+    print(f"状态已写入 {args.state}, 可用 run 开始迁移发布。")
 
 
 def cmd_plan_only(args) -> None:
@@ -542,6 +778,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-batch-size", type=int, required=True)
     p.add_argument("--max-batches", type=int, required=True)
     p.set_defaults(func=cmd_submit)
+
+    p = sub.add_parser("submit-migration",
+                       help="固定出口迁移: 校验目标规则并生成完整迁移计划")
+    p.add_argument("--topology", required=True)
+    p.add_argument("--old-rules", required=True)
+    p.add_argument("--new-rules", required=True)
+    p.add_argument("--registry", required=True)
+    p.add_argument("--state", required=True)
+    p.add_argument("--release-id", default="rel-mig-1")
+    p.add_argument("--traffic-class", required=True)
+    p.add_argument("--old-egress", required=True)
+    p.add_argument("--new-egress", required=True)
+    p.add_argument("--max-batch-size", type=int, required=True)
+    p.add_argument("--max-batches", type=int, required=True)
+    p.set_defaults(func=cmd_submit_migration)
 
     p = sub.add_parser("run", help="按计划发布(可反复执行, 自动对账续跑)")
     p.add_argument("--state", required=True)

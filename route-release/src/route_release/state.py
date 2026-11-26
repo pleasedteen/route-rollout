@@ -19,8 +19,8 @@ from typing import Any, Dict, Optional
 
 from .planner import Plan
 
-PHASES = ("RUNNING", "PAUSED", "FORWARD_COMPLETE",
-          "ROLLING_BACK", "ROLLED_BACK", "FAILED")
+PHASES = ("RUNNING", "PAUSED", "FORWARD_COMPLETE", "DRAINING",
+          "DECOMMISSIONED", "ROLLING_BACK", "ROLLED_BACK", "FAILED")
 
 
 class ReleaseStore:
@@ -46,7 +46,8 @@ class ReleaseStore:
 
     def create(self, *, release_id: str, topology_path: str,
                old_rules_path: str, new_rules_path: str,
-               plan: Plan, registry_path: str) -> None:
+               plan: Plan, registry_path: str,
+               migration: Optional[dict] = None) -> None:
         with self.lock:
             if self.exists():
                 raise SystemExit(f"发布状态已存在: {self.path}, "
@@ -64,6 +65,9 @@ class ReleaseStore:
                 "direction": "forward",
                 "applied": {},              # node -> 已确认生效的版本 token
                 "last_error": None,
+                # 固定出口迁移专用(普通发布为 None)
+                "migration": migration,
+                "decommission": None,       # 停用旧出口的结果记录
             })
 
     def update(self, **fields) -> Dict[str, Any]:

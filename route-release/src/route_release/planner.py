@@ -15,8 +15,12 @@ from itertools import combinations
 from typing import FrozenSet, List, Mapping, Optional, Sequence, Tuple
 
 from .model import (
+    Migration,
     Ruleset,
     Topology,
+    migration_mixed_reachable,
+    migration_rules_valid,
+    migration_target_gate,
     mixed_assignment_reachable,
     ruleset_from_plain,
     version_token,
@@ -211,3 +215,157 @@ def load_ruleset_file(path: str) -> Mapping[str, Ruleset]:
     with open(path, "r", encoding="utf-8") as fh:
         raw = json.load(fh)
     return {node: ruleset_from_plain(rules) for node, rules in raw.items()}
+
+
+# --------------------------------------------------------------- 固定出口迁移
+
+def _migration_batch_safe(
+    topo: Topology,
+    base: Mapping[str, Ruleset],
+    target: Mapping[str, Ruleset],
+    prefix: FrozenSet[str],
+    batch: Sequence[str],
+    mig: Migration,
+) -> Optional[str]:
+    """迁移版批次安全性: 任意部分生效子集下迁移类别在 {旧,新} 出口吸收即可。"""
+    for subset in _all_subsets(batch):
+        err = migration_mixed_reachable(topo, base, target,
+                                        prefix | subset, mig)
+        if err:
+            who = "空集" if not subset else "、".join(sorted(subset))
+            return f"批次 {sorted(batch)} 仅生效子集[{who}]时: {err}"
+    return None
+
+
+def _search_migration(
+    topo: Topology,
+    base: Mapping[str, Ruleset],
+    target: Mapping[str, Ruleset],
+    max_batch_size: int,
+    max_batches: int,
+    mig: Migration,
+    must_first: FrozenSet[str] = frozenset(),
+    forbidden_first: FrozenSet[str] = frozenset(),
+) -> Optional[Tuple[Tuple[str, ...], ...]]:
+    """迁移专用回溯搜索。
+
+    顺序约束(回退时使用):
+      must_first      中的节点只能进入第一批(旧出口先恢复接收);
+      forbidden_first 中的节点不能进入第一批(入口节点最后再切, 避免在旧出口
+                      恢复前把流量按旧规则送到已不再吸收的节点)。
+    """
+    nodes = list(topo.nodes)
+
+    def recurse(remaining: List[str],
+                batches: Tuple[Tuple[str, ...], ...]
+                ) -> Optional[Tuple[Tuple[str, ...], ...]]:
+        if not remaining:
+            return batches
+        prefix = frozenset().union(*batches) if batches else frozenset()
+        for node in tuple(remaining):
+            rest = [n for n in remaining if n != node]
+            # 选项 1: 加入任一未满的现有批次(保持批内有序)
+            for i, batch in enumerate(batches):
+                if len(batch) >= max_batch_size:
+                    continue
+                if i == 0 and node in forbidden_first:
+                    continue
+                if i != 0 and node in must_first:
+                    continue
+                new_batch = batch + (node,)
+                batch_prefix = (frozenset().union(*batches[:i])
+                                if i else frozenset())
+                if _migration_batch_safe(topo, base, target, batch_prefix,
+                                         new_batch, mig) is not None:
+                    continue
+                new_batches = batches[:i] + (new_batch,) + batches[i + 1:]
+                found = recurse(rest, new_batches)
+                if found is not None:
+                    return found
+            # 选项 2: 开启新批次
+            if len(batches) < max_batches:
+                opening_first = not batches
+                if opening_first and node in forbidden_first:
+                    continue
+                if not opening_first and node in must_first:
+                    continue
+                if _migration_batch_safe(topo, base, target, prefix,
+                                         [node], mig) is not None:
+                    continue
+                found = recurse(rest, batches + ((node,),))
+                if found is not None:
+                    return found
+        return None
+
+    return recurse(nodes, ())
+
+
+def make_migration_plan(
+    topo: Topology,
+    base: Mapping[str, Ruleset],
+    target: Mapping[str, Ruleset],
+    mig: Migration,
+    max_batch_size: int,
+    max_batches: int,
+    direction: str = "forward",
+    ordering: bool = False,
+) -> Plan:
+    """固定出口迁移的批次规划。
+
+    正向: 先做目标规则闸校验(不过直接失败、不动配置), 再枚举任意部分生效子集。
+    回退: ordering=True, 旧出口必须第一批恢复, 入口节点不进第一批。
+    两者都受单批规模与总批数上限约束。
+    """
+    from_tokens = {n: version_token(base[n]) for n in topo.nodes}
+    to_tokens = {n: version_token(target[n]) for n in topo.nodes}
+    if max_batch_size < 1 or max_batches < 1:
+        return _fail(direction, max_batch_size, max_batches, from_tokens, to_tokens,
+                     "单批服务数上限和总批数上限都必须 >= 1")
+    for name, cfg in (("起始", base), ("目标", target)):
+        err = migration_rules_valid(topo, cfg, mig)
+        if err:
+            return _fail(direction, max_batch_size, max_batches, from_tokens,
+                         to_tokens, f"{name}配置本身不合法: {err}")
+
+    # 入口节点 = 除新旧出口之外的全部节点
+    ingress = frozenset(topo.nodes) - {mig.old_egress, mig.new_egress}
+    if direction == "forward":
+        err = migration_target_gate(topo, target, mig)
+        if err:
+            return _fail(direction, max_batch_size, max_batches, from_tokens,
+                         to_tokens, err)
+        must_first: FrozenSet[str] = frozenset()
+        forbidden_first: FrozenSet[str] = frozenset()
+    else:
+        must_first = frozenset({mig.old_egress})
+        forbidden_first = ingress if ordering else frozenset()
+
+    if all(base[x] == target[x] for x in topo.nodes):
+        return Plan(direction, (), max_batch_size, max_batches, from_tokens, to_tokens)
+
+    n = len(topo.nodes)
+    min_batches_by_size = (n + max_batch_size - 1) // max_batch_size
+    if min_batches_by_size > max_batches:
+        return _fail(
+            direction, max_batch_size, max_batches, from_tokens, to_tokens,
+            f"{n} 台服务、单批最多 {max_batch_size} 台, 至少需要 "
+            f"{min_batches_by_size} 批, 超过总批数上限 {max_batches}",
+        )
+
+    found = _search_migration(topo, base, target, max_batch_size, max_batches,
+                              mig, must_first, forbidden_first)
+    if found is not None:
+        return Plan(direction, found, max_batch_size, max_batches,
+                    from_tokens, to_tokens)
+
+    relaxed = _search_migration(topo, base, target, max_batch_size, n, mig,
+                                must_first, forbidden_first)
+    if relaxed is not None:
+        reason = (
+            f"在单批不超过 {max_batch_size} 台、且任意部分生效都保持可达的约束下, "
+            f"至少需要 {len(relaxed)} 批(建议顺序: "
+            f"{[list(b) for b in relaxed]}), 超过总批数上限 {max_batches}。"
+        )
+    else:
+        reason = "不存在满足任意部分生效均可达的迁移批次划分, 请检查两套配置"
+    return _fail(direction, max_batch_size, max_batches, from_tokens, to_tokens, reason)

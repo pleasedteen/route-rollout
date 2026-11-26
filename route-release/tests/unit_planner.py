@@ -17,11 +17,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "src"))
 
 from route_release.model import (  # noqa: E402
-    Rule, Topology, mixed_assignment_reachable, ruleset_from_plain,
+    Migration, Rule, Topology, migration_rules_valid,
+    migration_target_gate, mixed_assignment_reachable, ruleset_from_plain,
     trace_path, version_token,
 )
 from route_release.planner import (  # noqa: E402
-    _all_subsets, load_ruleset_file, make_plan,
+    _all_subsets, load_ruleset_file, make_migration_plan, make_plan,
 )
 
 EX = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -115,6 +116,45 @@ def main():
                 rb_safe = False
         prefix |= frozenset(batch)
     check("回退任意部分生效也可达", rb_safe)
+
+    print("== 固定出口迁移规划 ==")
+    mt = Topology.from_dict(load("topology.json"))
+    mold = load_ruleset_file(os.path.join(EX, "migration_old_rules.json"))
+    mnew = load_ruleset_file(os.path.join(EX, "migration_new_rules.json"))
+    mig = Migration("video", "hub", "relay1")
+    check("迁移起始/目标配置均合法",
+          migration_rules_valid(mt, mold, mig) is None
+          and migration_rules_valid(mt, mnew, mig) is None)
+    check("目标闸通过: 新出口吸收、旧出口转发",
+          migration_target_gate(mt, mnew, mig) is None)
+    mbad = load_ruleset_file(os.path.join(EX, "migration_bad_target.json"))
+    bad_gate = migration_target_gate(mt, mbad, mig)
+    check("目标闸拦截新出口未成为 local_egress",
+          bad_gate is not None and "local_egress" in bad_gate, bad_gate)
+    mplan = make_migration_plan(mt, mold, mnew, mig, 2, 4)
+    check("迁移规划成功且满足两项上限",
+          mplan.ok and len(mplan.batches) <= 4
+          and all(len(b) <= 2 for b in mplan.batches), mplan.reason)
+    check("坏目标在规划阶段被拒(无解)",
+          not make_migration_plan(mt, mold, mbad, mig, 2, 4).ok)
+    # 迁移任意部分生效子集: 迁移类别允许在旧/新出口吸收
+    from route_release.model import migration_mixed_reachable
+    prefix = frozenset()
+    mig_safe = True
+    for batch in mplan.batches:
+        for s in _all_subsets(batch):
+            if migration_mixed_reachable(mt, mold, mnew, prefix | s, mig):
+                mig_safe = False
+        prefix |= frozenset(batch)
+    check("迁移任意部分生效子集均可达(新旧出口均可吸收)", mig_safe)
+    mrb = make_migration_plan(mt, mnew, mold, mig, 2, 4,
+                              direction="rollback", ordering=True)
+    check("迁移回退规划成功且满足上限", mrb.ok, mrb.reason)
+    check("回退第一批是旧出口 hub", mrb.batches and mrb.batches[0] == ("hub",),
+          str(mrb.batches))
+    ingress = set(mt.nodes) - {"hub", "relay1"}
+    check("入口节点不进回退第一批",
+          not (set(mrb.batches[0]) & ingress), str(mrb.batches))
 
     print("=" * 56)
     if FAILED:

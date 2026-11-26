@@ -1,0 +1,37 @@
+{
+  "edge1": {
+    "voice": {"next_hop": "relay1"},
+    "data":  {"next_hop": "relay1"},
+    "video": {"next_hop": "relay1"}
+  },
+  "edge2": {
+    "voice": {"next_hop": "relay1"},
+    "data":  {"next_hop": "relay2"},
+    "video": {"next_hop": "relay1"}
+  },
+  "edge3": {
+    "voice": {"next_hop": "relay2"},
+    "data":  {"next_hop": "relay2"},
+    "video": {"next_hop": "relay1"}
+  },
+  "edge4": {
+    "voice": {"next_hop": "relay2"},
+    "data":  {"next_hop": "relay2"},
+    "video": {"next_hop": "relay1"}
+  },
+  "relay1": {
+    "voice": {"next_hop": "hub"},
+    "data":  {"next_hop": "hub"},
+    "video": {"next_hop": "relay2"}
+  },
+  "relay2": {
+    "voice": {"next_hop": "hub"},
+    "data":  {"next_hop": "hub"},
+    "video": {"next_hop": "hub"}
+  },
+  "hub": {
+    "voice": {"local_egress": true},
+    "data":  {"local_egress": true},
+    "video": {"local_egress": true}
+  }
+}
