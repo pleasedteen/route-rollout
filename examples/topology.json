@@ -1,0 +1,9 @@
+{
+  "nodes": ["edge1", "edge2", "edge3", "edge4", "relay1", "relay2", "hub"],
+  "classes": ["voice", "data", "video"],
+  "egress": {
+    "voice": "hub",
+    "data": "hub",
+    "video": "hub"
+  }
+}

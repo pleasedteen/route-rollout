@@ -1,0 +1,5 @@
+{
+  "a": {"c1": {"next_hop": "b"}},
+  "b": {"c1": {"local_egress": true}},
+  "c": {"c1": {"next_hop": "a"}}
+}

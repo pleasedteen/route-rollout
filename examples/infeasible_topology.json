@@ -1,0 +1,5 @@
+{
+  "nodes": ["a", "b", "c"],
+  "classes": ["c1"],
+  "egress": {"c1": "b"}
+}

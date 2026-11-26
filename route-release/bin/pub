@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# 发布工具薄封装: 用法 bin/pub <workdir> <子命令> [该子命令的参数...]
+# 例: bin/pub .manual-workdir status
+#     bin/pub .manual-workdir run --max-seconds 60
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+WD="$1"; shift
+exec python3 -I "$HERE/pub.py" "$@" --state "$WD/release.json"
