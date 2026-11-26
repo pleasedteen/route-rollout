@@ -1,13 +1,19 @@
 """可独立运行的本地转发服务。
 
 每台服务持有本节点的整套下一跳规则, 控制面提供:
-  GET  /status   查询实际生效版本与各类流量下一跳
+  GET  /status   查询实际生效版本、栅栏代数与各类流量下一跳
   POST /apply    整套切换本机规则(幂等: 按规则内容指纹去重, 确认丢失可安全重发)
+  POST /fence    抬高栅栏代数, 让更早代数的 apply 永久失效(暂停/回退的确定性来源)
   POST /probe    从本节点出发模拟某类流量的真实转发, 逐跳访问下游服务,
                  带环路检测, 返回完整路径
   POST /shutdown 仅用于本地测试/演示的收尾
 
-生效配置通过"临时文件 + os.replace"原子落盘; 进程重启后自动恢复。
+栅栏代数(epoch floor): 每次 apply 可携带一个单调递增的 epoch。服务记住见过的
+最大值; 任何 epoch 小于该值的 apply 一律 409 拒绝且不改配置。因此暂停/回退一旦
+装上更高的栅栏, 迟到的正向请求(或重发)再到达也会被拒——确认丢失、网络延迟都
+不会让旧意图覆盖新结果。
+
+生效配置通过"临时文件 + os.replace"原子落盘; 进程重启后自动恢复(含栅栏代数)。
 仅使用标准库, 可用 `python -I` 直接运行。
 """
 from __future__ import annotations
@@ -33,10 +39,11 @@ class ForwardingState:
         self.lock = threading.Lock()
         self.rules: Ruleset = {}
         self.version: str = ""
+        self.epoch_floor: int = 0
         os.makedirs(os.path.dirname(os.path.abspath(state_path)), exist_ok=True)
         loaded = self._load()
         if loaded is not None:
-            self.rules, self.version = loaded
+            self.rules, self.version, self.epoch_floor = loaded
         else:
             self.rules = dict(initial)
             self.version = version_token(self.rules)
@@ -50,12 +57,13 @@ class ForwardingState:
         if data.get("node") != self.node:
             raise RuntimeError(f"状态文件属于节点 {data.get('node')}, 与 {self.node} 不符")
         rules = ruleset_from_plain(data["rules"])
-        return rules, data["version"]
+        return rules, data["version"], int(data.get("epoch_floor", 0))
 
     def _persist_locked(self) -> None:
         payload = {
             "node": self.node,
             "version": self.version,
+            "epoch_floor": self.epoch_floor,
             "rules": ruleset_to_plain(self.rules),
         }
         tmp = self.state_path + ".tmp"
@@ -70,6 +78,7 @@ class ForwardingState:
             return {
                 "node": self.node,
                 "version": self.version,
+                "epoch_floor": self.epoch_floor,
                 "rules": ruleset_to_plain(self.rules),
                 "next_hops": {
                     cls: ("<local-egress>" if r.local_egress else r.next_hop)
@@ -77,21 +86,44 @@ class ForwardingState:
                 },
             }
 
-    def apply(self, plain_rules: Dict[str, dict]) -> dict:
-        """整套切换; 内容相同则直接返回当前版本(幂等)。"""
+    def apply(self, plain_rules: Dict[str, dict], epoch: Optional[int] = None) -> dict:
+        """整套切换; 内容相同则直接返回当前版本(幂等)。
+
+        带 epoch 时: 低于当前栅栏的请求被拒(不改配置, 返回 stale);
+        不小于栅栏则抬高栅栏并生效。不带 epoch 的请求保持旧行为(测试/手工)。
+        """
         new_rules = ruleset_from_plain(plain_rules)
         new_version = version_token(new_rules)
         with self.lock:
+            if epoch is not None:
+                epoch = int(epoch)
+                if epoch < self.epoch_floor:
+                    return {"node": self.node, "version": self.version,
+                            "epoch_floor": self.epoch_floor, "stale": True,
+                            "changed": False, "duplicate": False}
+                self.epoch_floor = epoch
             if new_version == self.version:
+                self._persist_locked()  # 栅栏可能被抬高, 需要落盘
                 return {"node": self.node, "version": self.version,
+                        "epoch_floor": self.epoch_floor,
                         "changed": False, "duplicate": True}
             old_version = self.version
             self.rules = new_rules
             self.version = new_version
             self._persist_locked()
             return {"node": self.node, "version": self.version,
+                    "epoch_floor": self.epoch_floor,
                     "old_version": old_version, "changed": True,
                     "duplicate": False}
+
+    def fence(self, epoch: int) -> dict:
+        """抬高栅栏代数; 不改规则。低于该代数的 apply 从此被拒。"""
+        with self.lock:
+            if epoch > self.epoch_floor:
+                self.epoch_floor = epoch
+                self._persist_locked()
+            return {"node": self.node, "version": self.version,
+                    "epoch_floor": self.epoch_floor}
 
     def _registry(self) -> dict:
         with open(self.registry_path, "r", encoding="utf-8") as fh:
@@ -167,7 +199,13 @@ class Handler(BaseHTTPRequestHandler):
                 if "rules" not in data:
                     self._send(400, {"error": "缺少 rules 字段"})
                     return
-                self._send(200, self.state.apply(data["rules"]))
+                result = self.state.apply(data["rules"], data.get("epoch"))
+                self._send(409 if result.get("stale") else 200, result)
+            elif self.path == "/fence":
+                if "epoch" not in data:
+                    self._send(400, {"error": "缺少 epoch 字段"})
+                    return
+                self._send(200, self.state.fence(int(data["epoch"])))
             elif self.path == "/probe":
                 result = self.state.probe(
                     data["class"], data.get("path", []),

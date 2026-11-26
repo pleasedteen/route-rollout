@@ -1,12 +1,15 @@
 """故障夹具代理: 夹在发布工具与转发服务之间, 复现发布现场故障。
 
-支持的故障模式(写在 JSON 配置里):
+支持的故障模式(写在 JSON 配置里, 在线改写即时生效):
   drop_confirm  服务已执行成功, 但代理吞掉响应 -> 发布进程收不到确认
   drop_request  代理直接丢弃请求(服务根本不知道这次切换)
   flaky         前几次请求失败, 之后恢复 -> 验证重试/幂等
-  delay         响应延迟, 模拟慢节点
+  blackhole     所有请求都不转发、直接断开 -> 等效节点失联(状态/栅栏也查不到)
+  delay_sec     在转发前先等待若干秒 -> 复现"延迟投递/在途请求"
 
-只代理 HTTP, 服务之间的 /probe 走注册表直连, 不经过本代理。
+只代理 HTTP, 服务之间的 /probe 走注册表直连, 不经过本代理。故障只作用于
+变更操作 POST /apply; /status 与 /fence 默认放行(blackhole 除外)——这正是
+"确认丢失但仍能查到真实生效状态并装栅栏"的前提。
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ import os
 import random
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -37,51 +41,66 @@ class ProxyConfig:
         with open(self.path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
         with self.lock:
-            new_sig = (data.get("mode", "pass"), int(data.get("fail_times", 1)))
+            new_sig = (data.get("mode", "pass"), int(data.get("fail_times", 1)),
+                       float(data.get("delay_sec", 0)),
+                       int(data.get("delay_times", -1)),
+                       bool(data.get("blackhole", False)))
             should_reset = force or not hasattr(self, "remaining") \
                 or new_sig != self._signature()
             self.target = data["target"]
             self.mode = data.get("mode", "pass")
             self.fail_times = int(data.get("fail_times", 1))
             self.delay_sec = float(data.get("delay_sec", 0))
+            self.delay_times = int(data.get("delay_times", -1))
+            self.blackhole = bool(data.get("blackhole", False))
             self.seed = int(data.get("seed", 0))
             if should_reset:  # 模式/失败次数变化才重置计数, 便于在线切换故障
                 self.rng = random.Random(self.seed)
                 self.remaining = self.fail_times
+                self.delays_left = self.delay_times
                 self.counters = {"requests": 0, "dropped_confirm": 0,
                                  "dropped_request": 0, "flaky_failed": 0,
-                                 "passed": 0}
+                                 "delayed": 0, "blackholed": 0, "passed": 0}
             self._mtime = mtime
 
     def _signature(self):
-        return (self.mode, self.fail_times)
+        return (self.mode, self.fail_times, self.delay_sec, self.delay_times,
+                self.blackhole)
 
     def decide(self) -> str:
-        """返回 drop_confirm / drop_request / flaky_fail / pass。
+        """返回 drop_confirm / drop_request / flaky_fail / delay / blackhole / pass。
 
         所有故障模式都遵守 fail_times 配额: 注入这么多次后自动恢复为 pass,
-        用来复现"前几次失败、之后自愈"的真实故障。
+        用来复现"前几次失败、之后自愈"的真实故障。delay 额外受 delay_times
+        约束(-1 表示一直延迟)。
         """
         self.reload()  # 在线读取最新故障配置
+        delay = 0.0
         with self.lock:
             self.counters["requests"] += 1
-            mode = self.mode
-            if mode == "pass":
-                action = "pass"
-            elif mode in ("drop_confirm", "drop_request", "flaky"):
+            if self.blackhole:
+                action = "blackhole"
+            elif self.delay_sec > 0 and self.delays_left != 0:
+                action = "delay"
+                delay = self.delay_sec
+                if self.delays_left > 0:
+                    self.delays_left -= 1
+            elif self.mode in ("drop_confirm", "drop_request", "flaky"):
                 if self.remaining > 0:
                     self.remaining -= 1
-                    action = ("flaky_fail" if mode == "flaky" else mode)
+                    action = ("flaky_fail" if self.mode == "flaky" else self.mode)
                 else:
                     action = "pass"
+            elif self.mode == "pass":
+                action = "pass"
             else:
-                raise ValueError(f"未知故障模式 {mode}")
+                raise ValueError(f"未知故障模式 {self.mode}")
             if action == "pass":
                 self.counters["passed"] += 1
             else:
                 self.counters[action] = self.counters.get(action, 0) + 1
-            delay = self.delay_sec
         if delay:
+            # 在锁外睡眠: 让后续请求可以并行排队, 复现"多个在途请求".
             time.sleep(delay)
         return action
 
@@ -102,10 +121,19 @@ class Handler(BaseHTTPRequestHandler):
     def _handle(self, method: str):
         length = int(self.headers.get("Content-Length", "0"))
         payload = self.rfile.read(length) if length else b""
-        # 故障只作用于变更操作 POST /apply。状态查询 /status、逐跳探测 /probe
-        # 始终放行——这正是"确认丢失但能查到真实生效状态"的前提。
+        # 故障只作用于变更操作 POST /apply。状态查询 /status、装栅栏 /fence
+        # 始终放行(blackhole 除外)——这正是"确认丢失但仍能查到真实生效状态
+        # 并装栅栏"的前提。
         fault_active = (method == "POST" and self.path == "/apply")
-        action = self.cfg.decide() if fault_active else "pass"
+        if fault_active:
+            action = self.cfg.decide()
+        else:
+            # 非变更请求不计入故障配额, 但仍受 blackhole 影响
+            self.cfg.reload()
+            action = "blackhole" if self.cfg.blackhole else "pass"
+        if action == "blackhole":
+            self.close_connection = True
+            return
         if action == "drop_request":
             # 模拟请求在网络上消失: 直接关闭连接, 什么都不转发
             self.close_connection = True
@@ -119,6 +147,10 @@ class Handler(BaseHTTPRequestHandler):
             with urllib.request.urlopen(req, timeout=10) as resp:
                 body = resp.read()
                 status = resp.status
+        except urllib.error.HTTPError as exc:
+            # 上游的 4xx(如栅栏拒止的 409)是正常语义, 原样透传, 不要伪装成 502
+            body = exc.read()
+            status = exc.code
         except Exception as exc:
             body = json.dumps({"error": f"proxy upstream error: {exc}"}).encode()
             self._send(502, body)
